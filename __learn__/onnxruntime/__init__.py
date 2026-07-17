@@ -45,8 +45,29 @@ try:
         SessionIOBinding,  # noqa: F401
         SessionOptions,  # noqa: F401
         create_and_register_allocator,  # noqa: F401
+        create_and_register_allocator_v2,  # noqa: F401
+        disable_telemetry_events,  # noqa: F401
+        enable_telemetry_events,  # noqa: F401
+        get_all_providers,  # noqa: F401
+        get_available_providers,  # noqa: F401
+        get_build_info,
+        get_device,  # noqa: F401
+        get_ep_devices,  # noqa: F401
+        get_version_string,  # noqa: F401
+        has_collective_ops,  # noqa: F401
+        register_execution_provider_library,
+        set_default_logger_severity,  # noqa: F401
+        set_default_logger_verbosity,  # noqa: F401
+        set_global_thread_pool_sizes,  # noqa: F401
+        set_seed,  # noqa: F401
+        unregister_executor_provider_library,  # noqa: F401
     )
 
     import_capi_exception = None
 except Exception as e:
     import_capi_exception = e
+
+from onnxruntime.capi import onnxruntime_validation
+
+if import_capi_exception:
+    raise import_capi_exception
