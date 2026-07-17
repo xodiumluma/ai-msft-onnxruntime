@@ -3,25 +3,71 @@
 // Licensed under the MIT License.
 
 #include "contrib_ops/cuda/moe/qmoe_kernels.h"
+#include "core/common/narrow.h"
 #include "core/providers/cuda/cuda_common.h"
+#include "core/providers/cuda/cu_inc/cub.cuh"
+#include "core/providers/cuda/cu_inc/topk_warp_sort.cuh"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_kernels.h"
 #include <cuda_bf16.h>
-#include <cub/cub.cuh>
 #include <algorithm>
 #include <cfloat>
-#include <limits>
 
 namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
 int Compute1DGridSize(int num_elements, int block_size) {
-  ORT_ENFORCE(num_elements >= 0, "CUDA launch element count must be non-negative, got ", num_elements);
-  ORT_ENFORCE(block_size > 0, "CUDA launch block size must be positive, got ", block_size);
-  int64_t grid_size = (static_cast<int64_t>(num_elements) + block_size - 1) / block_size;
-  ORT_ENFORCE(grid_size <= std::numeric_limits<int>::max(),
-              "CUDA launch grid size exceeds int range: ", grid_size);
-  return static_cast<int>(grid_size);
+  return (num_elements + block_size - 1) / block_size;
+}
+
+constexpr float kTopKNormalizeEpsilon = 1e-6f;
+
+__device__ __forceinline__ float SoftmaxScale(float logit, float max_val, float inv_sum) {
+  return (inv_sum > 0.0f) ? expf(logit - max_val) * inv_sum : 0.0f;
+}
+
+__device__ __forceinline__ float SafeInvSum(float sum) {
+  return (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+}
+
+__device__ __forceinline__ float TopKNormalizeDenom(bool normalize_scales, float scale_sum) {
+  return (normalize_scales && scale_sum > kTopKNormalizeEpsilon) ? scale_sum : 1.0f;
+}
+
+__device__ __forceinline__ float WarpReduceMax(float value) {
+  constexpr int kWarpSize = onnxruntime::cuda::topk::kWarpSize;
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+    value = fmaxf(value, __shfl_xor_sync(0xFFFFFFFF, value, offset));
+  }
+  return value;
+}
+
+__device__ __forceinline__ float WarpReduceSum(float value) {
+  constexpr int kWarpSize = onnxruntime::cuda::topk::kWarpSize;
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+    value += __shfl_xor_sync(0xFFFFFFFF, value, offset);
+  }
+  return value;
+}
+
+template <typename BlockReduce>
+__device__ __forceinline__ float BlockReduceMax(float value, typename BlockReduce::TempStorage& temp_storage) {
+#if CUDART_VERSION >= 12090
+  return BlockReduce(temp_storage).Reduce(value, ::cuda::maximum());
+#else
+  return BlockReduce(temp_storage).Reduce(value, cub::Max());
+#endif
+}
+
+template <typename BlockReduce>
+__device__ __forceinline__ float BlockReduceSum(float value, typename BlockReduce::TempStorage& temp_storage) {
+#if CUDART_VERSION >= 12090
+  return BlockReduce(temp_storage).Reduce(value, ::cuda::std::plus());
+#else
+  return BlockReduce(temp_storage).Reduce(value, cub::Sum());
+#endif
 }
 
 template <typename T>
@@ -35,7 +81,7 @@ __global__ void SoftmaxTopKKernel(const T* logits, float* topk_scales, int* topk
   int* row_indices = topk_indices + row * k;
 
   // 1. Find max for numerical stability
-  float max_val = -FLT_MAX;
+  float max_val = onnxruntime::cuda::topk::kNegativeInfinity;
   for (int i = 0; i < num_experts; ++i) {
     float val = static_cast<float>(row_logits[i]);
     if (val > max_val) max_val = val;
@@ -46,6 +92,7 @@ __global__ void SoftmaxTopKKernel(const T* logits, float* topk_scales, int* topk
   for (int i = 0; i < num_experts; ++i) {
     sum_exp += expf(static_cast<float>(row_logits[i]) - max_val);
   }
+  const float inv_sum = SafeInvSum(sum_exp);
 
   // 3. Compute Softmax and find TopK
   // For small k, we can do a simple selection.
@@ -61,7 +108,7 @@ __global__ void SoftmaxTopKKernel(const T* logits, float* topk_scales, int* topk
   }
 
   for (int i = 0; i < num_experts; ++i) {
-    float prob = expf(static_cast<float>(row_logits[i]) - max_val) / sum_exp;
+    float prob = SoftmaxScale(static_cast<float>(row_logits[i]), max_val, inv_sum);
 
     // Insert into top-k logic
     // Simple insertion sort for very small k (e.g. k=2)
@@ -85,11 +132,263 @@ __global__ void SoftmaxTopKKernel(const T* logits, float* topk_scales, int* topk
     for (int i = 0; i < k; ++i) {
       scale_sum += row_scales[i];
     }
-    if (scale_sum > 1e-6f) {
+    if (scale_sum > kTopKNormalizeEpsilon) {
       for (int i = 0; i < k; ++i) {
         row_scales[i] /= scale_sum;
       }
     }
+  }
+}
+
+// Block-per-row softmax + top-k using a CUB block sort. Each block sorts one
+// row's logits (descending) and reads the first k. A full sort of 256 logits is
+// ~2.5x faster than k rounds of block-argmax on this size (benchmarked), and is
+// the layout onnxruntime-genai's top-k benchmarks also recommend (CUB block
+// merge) for sort sizes up to ~1024. The capacity (kBlockSize*kItemsPerThread)
+// must be >= num_experts; padding lanes carry (-inf, INT_MAX) so valid -inf
+// expert scores sort ahead of padding. Tie-breaking matches the scalar kernel
+// (lower expert index first) via the same packed stable sort key used by the
+// warp merge path.
+
+template <typename T, int kBlockSize, int kItemsPerThread>
+__global__ void SoftmaxTopKMergeKernel(const T* logits, float* topk_scales, int* topk_indices,
+                                       int num_rows, int num_experts, int k, bool normalize_scales) {
+  const int row = blockIdx.x;
+  if (row >= num_rows) return;
+
+  const T* row_logits = logits + static_cast<size_t>(row) * num_experts;
+  const int tid = threadIdx.x;
+
+  using BlockMergeSort = cub::BlockMergeSort<uint64_t, kBlockSize, kItemsPerThread, cub::NullType>;
+  using BlockReduce = cub::BlockReduce<float, kBlockSize>;
+  __shared__ union {
+    typename BlockMergeSort::TempStorage merge;
+    typename BlockReduce::TempStorage reduce;
+  } temp;
+  __shared__ float s_topk[64];  // k <= 64
+  __shared__ float s_max;
+  __shared__ float s_sum;
+
+  // Load this thread's packed (logit, expert index) keys in a blocked
+  // arrangement: thread t owns indices [t*ipt, t*ipt+ipt).
+  uint64_t keys[kItemsPerThread];
+  float local_max = onnxruntime::cuda::topk::kNegativeInfinity;
+#pragma unroll
+  for (int j = 0; j < kItemsPerThread; ++j) {
+    const int idx = tid * kItemsPerThread + j;
+    const float logit = (idx < num_experts) ? static_cast<float>(row_logits[idx])
+                                            : onnxruntime::cuda::topk::kNegativeInfinity;
+    const int index = (idx < num_experts) ? idx : INT_MAX;
+    keys[j] = onnxruntime::cuda::topk::PackStableSortKey(logit, index);
+    local_max = fmaxf(local_max, logit);
+  }
+
+  // Softmax denominator over all experts (needed when normalize_scales is false;
+  // when true it cancels in the top-k normalization but is still correct).
+  const float block_max = BlockReduceMax<BlockReduce>(local_max, temp.reduce);
+  if (tid == 0) s_max = block_max;
+  // Single barrier: publishes s_max to all threads and also separates the two
+  // BlockReduce uses that share temp.reduce.
+  __syncthreads();
+  const float max_val = s_max;
+
+  float local_sum = 0.0f;
+#pragma unroll
+  for (int j = 0; j < kItemsPerThread; ++j) {
+    const int idx = tid * kItemsPerThread + j;
+    if (idx < num_experts) {
+      local_sum += expf(onnxruntime::cuda::topk::UnpackStableSortScore(keys[j]) - max_val);
+    }
+  }
+  const float block_sum = BlockReduceSum<BlockReduce>(local_sum, temp.reduce);
+  if (tid == 0) s_sum = block_sum;
+  // Single barrier: publishes s_sum and separates temp.reduce from temp.merge.
+  __syncthreads();
+  const float inv_sum = SafeInvSum(s_sum);
+
+  // Sort packed (logit, index) keys descending. Result stays in a blocked
+  // layout, so sorted rank r lives in thread (r / ipt), item (r % ipt). Sort()
+  // leaves the sorted keys in each thread's registers and temp.merge is not
+  // reused afterwards, so no barrier is needed here; the shared s_topk writes
+  // below are published by the barrier that follows them.
+  BlockMergeSort(temp.merge).Sort(keys, onnxruntime::cuda::topk::Greater<uint64_t>());
+
+#pragma unroll
+  for (int j = 0; j < kItemsPerThread; ++j) {
+    const int rank = tid * kItemsPerThread + j;
+    if (rank < k) {
+      const uint64_t key = keys[j];
+      topk_indices[static_cast<size_t>(row) * k + rank] =
+          onnxruntime::cuda::topk::UnpackStableSortIndex(key);
+      s_topk[rank] = SoftmaxScale(onnxruntime::cuda::topk::UnpackStableSortScore(key), max_val, inv_sum);
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    if (normalize_scales) {
+      float scale_sum = 0.0f;
+      for (int i = 0; i < k; ++i) scale_sum += s_topk[i];
+      const float denom = TopKNormalizeDenom(normalize_scales, scale_sum);
+      for (int i = 0; i < k; ++i) topk_scales[static_cast<size_t>(row) * k + i] = s_topk[i] / denom;
+    } else {
+      for (int i = 0; i < k; ++i) topk_scales[static_cast<size_t>(row) * k + i] = s_topk[i];
+    }
+  }
+}
+
+// Warp-bitonic softmax + top-k for num_experts <= 32. Each warp handles one
+// row, with lane `l` owning expert `l`. The whole softmax reduction and the
+// sort are done with warp shuffles (no shared memory). This is the fastest path
+// for tiny expert counts per the onnxruntime-genai top-k benchmark. Tie-breaking
+// (equal scores prefer the lower expert index) matches SoftmaxTopKMergeKernel.
+template <typename T, int kWarpsPerBlock>
+__global__ void SoftmaxTopKWarpBitonicKernel(const T* logits, float* topk_scales, int* topk_indices,
+                                             int num_rows, int num_experts, int k, bool normalize_scales) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.x * kWarpsPerBlock + threadIdx.y;
+  if (row >= num_rows) return;
+
+  const T* row_logits = logits + static_cast<size_t>(row) * num_experts;
+  const float logit = (lane < num_experts) ? static_cast<float>(row_logits[lane])
+                                           : onnxruntime::cuda::topk::kNegativeInfinity;
+
+  const float max_val = WarpReduceMax(logit);
+
+  // Warp-wide exp sum (softmax denominator over all experts).
+  const float sum_exp = WarpReduceSum((lane < num_experts) ? expf(logit - max_val) : 0.0f);
+  const float inv_sum = SafeInvSum(sum_exp);
+
+  // Sort (logit, expert index) descending; sorting by logit is equivalent to
+  // sorting by softmax probability since the mapping is monotonic.
+  float score = logit;
+  int index = (lane < num_experts) ? lane : INT_MAX;
+  onnxruntime::cuda::topk::WarpBitonicSortDescending(score, index);
+
+  // Lane r now holds the rank-r element. Compute the top-k probabilities.
+  float prob = (lane < k) ? SoftmaxScale(score, max_val, inv_sum) : 0.0f;
+
+  if (normalize_scales) {
+    prob /= TopKNormalizeDenom(normalize_scales, WarpReduceSum(prob));
+  }
+
+  if (lane < k) {
+    topk_scales[static_cast<size_t>(row) * k + lane] = prob;
+    topk_indices[static_cast<size_t>(row) * k + lane] = index;
+  }
+}
+
+// Warp CUB merge sort softmax + top-k for num_experts <= kBufferSize (64). One
+// warp (32 threads) per block sorts a row's logits held in shared memory. This
+// is the genai-recommended path for sort sizes in (32, 64]. Tie-breaking
+// matches SoftmaxTopKMergeKernel via a packed stable sort key.
+template <typename T, int kBufferSize>
+__global__ void SoftmaxTopKWarpMergeKernel(const T* logits, float* topk_scales, int* topk_indices,
+                                           int num_rows, int num_experts, int k, bool normalize_scales) {
+  constexpr int kWarpSize = onnxruntime::cuda::topk::kWarpSize;
+  using WarpMergeSorter = onnxruntime::cuda::topk::WarpMergeSorter<kBufferSize>;
+
+  const int row = blockIdx.x;
+  if (row >= num_rows) return;
+  const int lane = threadIdx.x;
+
+  __shared__ float s_scores[kBufferSize];
+  __shared__ int s_indices[kBufferSize];
+  __shared__ typename WarpMergeSorter::TempStorage temp_storage;
+
+  const T* row_logits = logits + static_cast<size_t>(row) * num_experts;
+
+  // Load logits into shared memory and compute the warp-wide max.
+  float local_max = onnxruntime::cuda::topk::kNegativeInfinity;
+  for (int i = lane; i < kBufferSize; i += kWarpSize) {
+    const float v = (i < num_experts) ? static_cast<float>(row_logits[i])
+                                      : onnxruntime::cuda::topk::kNegativeInfinity;
+    s_scores[i] = v;
+    s_indices[i] = (i < num_experts) ? i : INT_MAX;
+    local_max = fmaxf(local_max, v);
+  }
+  const float max_val = WarpReduceMax(local_max);
+
+  // Warp-wide exp sum over all experts.
+  float local_sum = 0.0f;
+  for (int i = lane; i < num_experts; i += kWarpSize) {
+    local_sum += expf(s_scores[i] - max_val);
+  }
+  const float inv_sum = SafeInvSum(WarpReduceSum(local_sum));
+
+  __syncwarp();
+  WarpMergeSorter::Sort(s_scores, s_indices, temp_storage, num_experts);
+  __syncwarp();
+
+  // s_scores[r]/s_indices[r] now hold the rank-r logit/expert index.
+  float scale_sum = 0.0f;
+  if (normalize_scales) {
+    for (int i = lane; i < k; i += kWarpSize) {
+      scale_sum += SoftmaxScale(s_scores[i], max_val, inv_sum);
+    }
+    scale_sum = WarpReduceSum(scale_sum);
+  }
+  const float denom = TopKNormalizeDenom(normalize_scales, scale_sum);
+
+  for (int i = lane; i < k; i += kWarpSize) {
+    const float prob = SoftmaxScale(s_scores[i], max_val, inv_sum);
+    topk_scales[static_cast<size_t>(row) * k + i] = normalize_scales ? (prob / denom) : prob;
+    topk_indices[static_cast<size_t>(row) * k + i] = s_indices[i];
+  }
+}
+
+template <typename T>
+void DispatchSoftmaxTopK(const T* logits, float* topk_scales, int* topk_indices,
+                         int num_rows, int num_experts, int k, bool normalize_scales,
+                         cudaStream_t stream) {
+  ORT_ENFORCE(k > 0 && k <= num_experts,
+              "SoftmaxTopK requires 0 < k <= num_experts, got k=", k,
+              " and num_experts=", num_experts);
+
+  // Block-per-row CUB merge sort is the fastest path for the common decode case
+  // (one block fully sorts a row). Pick the smallest capacity that covers
+  // num_experts. k must fit in s_topk (<= 64).
+  const dim3 grid(static_cast<unsigned>(num_rows));
+  if (k <= 64 && num_experts <= 1024) {
+    // Tiny expert counts: a single warp sorts a row entirely in registers via
+    // an in-register bitonic sort (no shared memory). Multiple warps per block
+    // process multiple rows for better occupancy.
+    if (num_experts <= onnxruntime::cuda::topk::kWarpBitonicMaxSize) {
+      constexpr int kWarpsPerBlock = 8;
+      const dim3 block(static_cast<unsigned>(onnxruntime::cuda::topk::kWarpSize), kWarpsPerBlock);
+      const dim3 bitonic_grid(static_cast<unsigned>((num_rows + kWarpsPerBlock - 1) / kWarpsPerBlock));
+      SoftmaxTopKWarpBitonicKernel<T, kWarpsPerBlock><<<bitonic_grid, block, 0, stream>>>(
+          logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
+      return;
+    } else if (num_experts <= onnxruntime::cuda::topk::kWarpMergeMaxSize) {
+      // Single warp per row sorts up to 64 logits in shared memory (CUB warp
+      // merge sort), the genai-recommended path for sort sizes in (32, 64].
+      SoftmaxTopKWarpMergeKernel<T, 64><<<grid, onnxruntime::cuda::topk::kWarpSize, 0, stream>>>(
+          logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
+      return;
+    } else if (num_experts <= 128) {
+      SoftmaxTopKMergeKernel<T, 128, 1><<<grid, 128, 0, stream>>>(
+          logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
+      return;
+    } else if (num_experts <= 256) {
+      SoftmaxTopKMergeKernel<T, 128, 2><<<grid, 128, 0, stream>>>(
+          logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
+      return;
+    } else if (num_experts <= 512) {
+      SoftmaxTopKMergeKernel<T, 128, 4><<<grid, 128, 0, stream>>>(
+          logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
+      return;
+    } else /*if (num_experts <= 1024)*/ {
+      SoftmaxTopKMergeKernel<T, 256, 4><<<grid, 256, 0, stream>>>(
+          logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
+      return;
+    }
+  } else {
+    // Fall back to the simple one-thread-per-row kernel.
+    const int block = 256;
+    const int grid_1d = Compute1DGridSize(num_rows, block);
+    SoftmaxTopKKernel<T><<<grid_1d, block, 0, stream>>>(
+        logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
   }
 }
 
@@ -102,9 +401,7 @@ void LaunchSoftmaxTopK(
     int k,
     bool normalize_scales,
     cudaStream_t stream) {
-  int block = 256;
-  int grid = Compute1DGridSize(num_rows, block);
-  SoftmaxTopKKernel<float><<<grid, block, 0, stream>>>(logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
+  DispatchSoftmaxTopK<float>(logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales, stream);
 }
 
 void LaunchSoftmaxTopK(
@@ -116,9 +413,7 @@ void LaunchSoftmaxTopK(
     int k,
     bool normalize_scales,
     cudaStream_t stream) {
-  int block = 256;
-  int grid = Compute1DGridSize(num_rows, block);
-  SoftmaxTopKKernel<half><<<grid, block, 0, stream>>>(logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
+  DispatchSoftmaxTopK<half>(logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales, stream);
 }
 
 void LaunchSoftmaxTopK(
@@ -130,9 +425,7 @@ void LaunchSoftmaxTopK(
     int k,
     bool normalize_scales,
     cudaStream_t stream) {
-  int block = 256;
-  int grid = Compute1DGridSize(num_rows, block);
-  SoftmaxTopKKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales);
+  DispatchSoftmaxTopK<__nv_bfloat16>(logits, topk_scales, topk_indices, num_rows, num_experts, k, normalize_scales, stream);
 }
 
 template <typename T>
@@ -280,6 +573,76 @@ void LaunchQMoEPrePackOffsetBias(
   int block = 256;
   int grid = Compute1DGridSize(num_elements, block);
   QMoEPrePackZPKernel<__nv_bfloat16><<<grid, block, 0, stream>>>(zp, scales, output, num_elements, offset);
+}
+
+// Batched 4-bit packed ZP scaled bias kernel.
+// Grid: (ceil(n/16), ceil(k_blocks/16), experts)
+// Each thread computes one output element: output[e][out_row][out_col]
+// where out_row in [0, k_blocks), out_col in [0, n).
+// ZP layout: [experts, n, packed_k_blocks] with packed_k_blocks = (k_blocks+1)/2
+// Scale/Output layout: [experts, k_blocks, n]
+template <typename T>
+__global__ void QMoEScaledZP4BitBatchedKernel(
+    const uint8_t* packed_zp,
+    const T* transposed_scale,
+    T* scaled_zero_point,
+    int n, int k_blocks,
+    float default_zero_point) {
+  int out_col = blockIdx.x * blockDim.x + threadIdx.x;
+  int out_row = blockIdx.y * blockDim.y + threadIdx.y;
+  int expert = blockIdx.z;
+
+  if (out_col < n && out_row < k_blocks) {
+    int packed_k_blocks = (k_blocks + 1) / 2;
+    int64_t expert_zp_offset = static_cast<int64_t>(expert) * n * packed_k_blocks;
+    int64_t expert_scale_offset = static_cast<int64_t>(expert) * k_blocks * n;
+
+    // ZP is [n, packed_k_blocks] per expert; in_row = out_col, in_col = out_row
+    int in_row = out_col;
+    int in_col = out_row;
+    int64_t packed_zp_offset = expert_zp_offset + static_cast<int64_t>(in_row) * packed_k_blocks + in_col / 2;
+    uint8_t packed_byte = packed_zp[packed_zp_offset];
+    float zero_point_val = static_cast<float>((in_col & 0x01) ? (packed_byte >> 4) : (packed_byte & 0x0f));
+
+    int64_t output_offset = expert_scale_offset + static_cast<int64_t>(out_row) * n + out_col;
+    T scale_val = transposed_scale[output_offset];
+    float result = static_cast<float>(scale_val) * (-zero_point_val + default_zero_point);
+    scaled_zero_point[output_offset] = static_cast<T>(result);
+  }
+}
+
+void LaunchQMoEScaledZP4BitBatched(
+    const uint8_t* packed_zp,
+    const half* transposed_scale,
+    half* scaled_zero_point,
+    int experts, int n, int k_blocks,
+    float default_zero_point,
+    cudaStream_t stream) {
+  constexpr int BLOCK_SIZE = 16;
+  dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE);
+  dim3 gridDim(
+      (n + BLOCK_SIZE - 1) / BLOCK_SIZE,
+      (k_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE,
+      experts);
+  QMoEScaledZP4BitBatchedKernel<half><<<gridDim, blockDim, 0, stream>>>(
+      packed_zp, transposed_scale, scaled_zero_point, n, k_blocks, default_zero_point);
+}
+
+void LaunchQMoEScaledZP4BitBatched(
+    const uint8_t* packed_zp,
+    const __nv_bfloat16* transposed_scale,
+    __nv_bfloat16* scaled_zero_point,
+    int experts, int n, int k_blocks,
+    float default_zero_point,
+    cudaStream_t stream) {
+  constexpr int BLOCK_SIZE = 16;
+  dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE);
+  dim3 gridDim(
+      (n + BLOCK_SIZE - 1) / BLOCK_SIZE,
+      (k_blocks + BLOCK_SIZE - 1) / BLOCK_SIZE,
+      experts);
+  QMoEScaledZP4BitBatchedKernel<__nv_bfloat16><<<gridDim, blockDim, 0, stream>>>(
+      packed_zp, transposed_scale, scaled_zero_point, n, k_blocks, default_zero_point);
 }
 
 __global__ void QMoEShiftWeightsKernel(const uint8_t* input, uint8_t* output, int num_elements) {
@@ -628,11 +991,7 @@ void LaunchQMoEDequantizeFp4WeightsImpl(
     cudaStream_t stream) {
   int64_t total = static_cast<int64_t>(num_experts) * n * k;
   constexpr int block = 256;
-  ORT_ENFORCE(total >= 0, "QMoEDequantizeFp4Weights: negative element count, got ", total);
-  int64_t grid_i64 = (total + block - 1) / block;
-  ORT_ENFORCE(grid_i64 <= std::numeric_limits<int>::max(),
-              "QMoEDequantizeFp4Weights: grid size exceeds int range: ", grid_i64);
-  int grid = static_cast<int>(grid_i64);
+  int grid = onnxruntime::narrow<int>((total + block - 1) / block);
   QMoEDequantizeFp4WeightsKernel<<<grid, block, 0, stream>>>(
       packed_weights, block_scales, global_scales, output, num_experts, n, k);
 }
@@ -715,11 +1074,7 @@ void LaunchQMoEDequantizeFp8WeightsImpl(
     cudaStream_t stream) {
   int64_t total = static_cast<int64_t>(num_experts) * n * k;
   constexpr int block = 256;
-  ORT_ENFORCE(total >= 0, "QMoEDequantizeFp8Weights: negative element count, got ", total);
-  int64_t grid_i64 = (total + block - 1) / block;
-  ORT_ENFORCE(grid_i64 <= std::numeric_limits<int>::max(),
-              "QMoEDequantizeFp8Weights: grid size exceeds int range: ", grid_i64);
-  int grid = static_cast<int>(grid_i64);
+  int grid = onnxruntime::narrow<int>((total + block - 1) / block);
   QMoEDequantizeFp8WeightsKernel<<<grid, block, 0, stream>>>(
       weights, global_scales, output, num_experts, n, k);
 }
@@ -744,6 +1099,59 @@ void LaunchQMoEDequantizeFp8Weights(
     int k,
     cudaStream_t stream) {
   LaunchQMoEDequantizeFp8WeightsImpl(weights, global_scales, output, num_experts, n, k, stream);
+}
+
+// Repack column-major FP4 packed weights to row-major layout.
+// Input: [experts, k, n/2] packed col-major (each byte holds 2 values along n).
+// Output: [experts, n, k/2] packed row-major (each byte holds 2 values along k).
+// One thread per output byte.
+__global__ void QMoERepackFP4ColToRowKernel(
+    const uint8_t* __restrict__ input,
+    uint8_t* __restrict__ output,
+    int experts,
+    int64_t k,
+    int64_t n) {
+  const int64_t k_half = k / 2;
+  const int64_t n_half = n / 2;
+  const int64_t out_expert_stride = n * k_half;
+  const int64_t in_expert_stride = k * n_half;
+  const int64_t total = static_cast<int64_t>(experts) * out_expert_stride;
+
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+
+  int64_t expert = idx / out_expert_stride;
+  int64_t rem = idx - expert * out_expert_stride;
+  int64_t row = rem / k_half;       // output row index [0, n)
+  int64_t col_byte = rem % k_half;  // output byte index [0, k/2)
+
+  int64_t col_even = col_byte * 2;
+  int64_t col_odd = col_even + 1;
+
+  // Source byte addresses: src[expert][col][row/2]
+  int64_t in_base = expert * in_expert_stride;
+  uint8_t src_even = input[in_base + col_even * n_half + row / 2];
+  uint8_t src_odd = input[in_base + col_odd * n_half + row / 2];
+
+  // Extract nibble based on row parity
+  uint8_t low_code = (row % 2 == 0) ? (src_even & 0x0F) : ((src_even >> 4) & 0x0F);
+  uint8_t high_code = (row % 2 == 0) ? (src_odd & 0x0F) : ((src_odd >> 4) & 0x0F);
+
+  output[idx] = low_code | static_cast<uint8_t>(high_code << 4);
+}
+
+void LaunchQMoERepackFP4ColToRow(
+    const uint8_t* input,
+    uint8_t* output,
+    int experts,
+    int64_t k,
+    int64_t n,
+    cudaStream_t stream) {
+  const int64_t total = static_cast<int64_t>(experts) * n * (k / 2);
+  constexpr int kThreads = 256;
+  int blocks = onnxruntime::narrow<int>((total + kThreads - 1) / kThreads);
+  QMoERepackFP4ColToRowKernel<<<blocks, kThreads, 0, stream>>>(
+      input, output, experts, k, n);
 }
 
 }  // namespace cuda
@@ -772,10 +1180,7 @@ __global__ void BatchedTransposeKernel(const T* __restrict__ input, T* __restric
 void LaunchBatchedTranspose(cudaStream_t stream, const void* input, void* output, int batch, int rows, int cols, int element_size) {
   int64_t total_elements = static_cast<int64_t>(batch) * rows * cols;
   int threads = 256;
-  int64_t blocks_i64 = (total_elements + threads - 1) / threads;
-  ORT_ENFORCE(blocks_i64 <= std::numeric_limits<int>::max(),
-              "LaunchBatchedTranspose grid size exceeds int range: ", blocks_i64);
-  int blocks = static_cast<int>(blocks_i64);
+  int blocks = onnxruntime::narrow<int>((total_elements + threads - 1) / threads);
 
   if (element_size == 1) {
     BatchedTransposeKernel<uint8_t><<<blocks, threads, 0, stream>>>(static_cast<const uint8_t*>(input), static_cast<uint8_t*>(output), batch, rows, cols);

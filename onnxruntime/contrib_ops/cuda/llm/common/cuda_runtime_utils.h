@@ -22,6 +22,7 @@
 #include <cuda_fp8.h>
 #endif
 #include "core/providers/cuda/shared_inc/cuda_call.h"
+#include "core/platform/env_var_utils.h"
 
 namespace onnxruntime::llm::common {
 inline int getDevice() {
@@ -61,8 +62,7 @@ inline std::optional<bool> isCudaLaunchBlocking() {
   thread_local bool firstCall = true;
   thread_local std::optional<bool> result = std::nullopt;
   if (!firstCall) {
-    char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
-    if (env != nullptr && std::string(env) == "1") {
+    if (ParseEnvironmentVariableWithDefault<int>("CUDA_LAUNCH_BLOCKING", 0) == 1) {
       result = true;
     } else {
       result = false;
@@ -75,7 +75,10 @@ inline std::optional<bool> isCudaLaunchBlocking() {
 inline bool isCapturing(cudaStream_t stream) {
   cudaStreamCaptureStatus status;
   CUDA_CALL_THROW(cudaStreamIsCapturing(stream, &status));
-  return status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive;
+  // Treat any non-None status as capturing. In addition to the common `Active` state, CUDA can
+  // report `Invalidated` when a capture has been corrupted but not yet ended; capture rules still
+  // apply in that state, so profiling/event/sync operations remain illegal and must be skipped.
+  return status != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone;
 }
 
 inline bool doCheckError(cudaStream_t stream) {

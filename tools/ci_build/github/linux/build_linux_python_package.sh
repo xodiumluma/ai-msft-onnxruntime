@@ -71,7 +71,7 @@ fi
 
 if [ "$BUILD_DEVICE" == "GPU" ]; then
     if [ "$CUDA_VERSION" == "12.8" ]; then
-        CUDA_ARCHS="60-real;70-real;75-real;80-real;86-real;90a-real;90-virtual"
+        CUDA_ARCHS="60-real;70-real;75-real;80-real;86-real;90-real;120-real;120-virtual"
     elif [ "$CUDA_VERSION" == "13.0" ]; then
         CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
     else
@@ -86,7 +86,9 @@ if [ "$BUILD_DEVICE" == "GPU" ]; then
         CUDA_HOME=/usr/local/cuda
     fi
     #Enable CUDA EP.
-    BUILD_ARGS+=("--use_cuda" "--cuda_version=$SHORT_CUDA_VERSION" "--cuda_home=$CUDA_HOME" "--cudnn_home=$CUDA_HOME" "--nvcc_threads=1" "--cmake_extra_defines" "CMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" "onnxruntime_USE_FPA_INTB_GEMM=OFF")
+    BUILD_ARGS+=("--use_cuda" "--cuda_version=$SHORT_CUDA_VERSION" "--cuda_home=$CUDA_HOME" "--cudnn_home=$CUDA_HOME")
+    BUILD_ARGS+=("--nvcc_threads=1" "--flash_nvcc_threads=1")
+    BUILD_ARGS+=("--cmake_extra_defines" "CMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" "onnxruntime_USE_FPA_INTB_GEMM=OFF")
     # Enable TRT EP only if TensorRT is installed.
     if [ -f /usr/include/NvInfer.h ]; then
         BUILD_ARGS+=("--use_tensorrt" "--tensorrt_home=/usr")
