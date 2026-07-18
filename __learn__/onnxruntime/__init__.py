@@ -71,3 +71,15 @@ from onnxruntime.capi import onnxruntime_validation
 
 if import_capi_exception:
     raise import_capi_exception
+
+from onnxruntime.capi.onnxruntime_inference_collection import (
+    AdapterFormat,  # noqa: F401
+    InferenceSession,  # noqa: F401
+    IOBinding,  # noqa: F401
+    ModelCompiler,  # noqa: F401
+    OrtDevice,  # noqa: 401
+    OrtDeviceVendorId,  # noqa: F401
+    OrtValue,  # noqa: F401
+    SparseTensor,  # noqa: F401
+    copy_tensors,  # noqa: F401
+)
